@@ -3,7 +3,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use bytes::{BufMut, BytesMut};
 use crate::event::{codec, model::{Event, BIN_SIZE}};
-use super::header::{SegmentHeader, SEGMENT_HEADER_SIZE, BlockHeader, BLOCK_HEADER_SIZE};
+use super::header::{SegmentHeader, SEGMENT_HEADER_SIZE, BlockHeader, BLOCK_HEADER_SIZE, EventRef};
 
 pub struct SegmentWriter{
     writer: BufWriter<File>,
@@ -13,6 +13,7 @@ pub struct SegmentWriter{
     min_timestamp: i64,
     max_timestamp: i64,
     bytes_written: u64,
+    segment_id: u32,
 }
 
 impl SegmentWriter {
@@ -42,10 +43,17 @@ impl SegmentWriter {
             min_timestamp: i64::MAX,
             max_timestamp: i64::MIN,
             bytes_written: SEGMENT_HEADER_SIZE as u64,
+            segment_id,
         })
     }
     
-    pub fn append(&mut self, event: &Event) -> io::Result<()> {
+    pub fn append(&mut self, event: &Event) -> io::Result<EventRef> {
+        let event_ref = EventRef {
+            segment_id: self.segment_id,
+            block_offset: self.bytes_written,
+            record_index: self.records_in_block,
+        };
+
         let encoded = codec::encode(event);
         self.payload_buf.put_slice(&encoded);
 
@@ -63,7 +71,7 @@ impl SegmentWriter {
             self.flush_block()?;
         }
 
-        Ok(())
+        Ok(event_ref)
     }
 
     pub fn flush_block(&mut self) -> io::Result<()> {
@@ -74,13 +82,13 @@ impl SegmentWriter {
         let block_size = self.payload_buf.len() as u32;
         let checksum = crc32fast::hash(&self.payload_buf);
 
-        let block_header = BlockHeader {
-            records_count: self.records_in_block,
+        let block_header = BlockHeader::new(
+            self.records_in_block,
             block_size,
             checksum,
-            min_timestamp: self.min_timestamp,
-            max_timestamp: self.max_timestamp,
-        };
+            self.min_timestamp,
+            self.max_timestamp
+        );
 
         self.writer.write_all(&block_header.encode())?;
         self.writer.write_all(&self.payload_buf)?;
