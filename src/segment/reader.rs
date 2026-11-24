@@ -1,9 +1,9 @@
 use super::header::{
-    BlockHeader, SegmentHeader, BLOCK_HEADER_SIZE, FORMAT_VERSION, MAGIC, SEGMENT_HEADER_SIZE,
+    BLOCK_HEADER_SIZE, BlockHeader, FORMAT_VERSION, MAGIC, SEGMENT_HEADER_SIZE, SegmentHeader, EventRef
 };
 use crate::event::{
     codec::{self, DecodeError},
-    model::{Event, BIN_SIZE},
+    model::{BIN_SIZE, Event},
 };
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -13,7 +13,7 @@ use std::io::{self, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// Защита от чрезмерного выделения памяти при повреждении поля block_size (например, лимит 64 МБ)
-const MAX_BLOCK_SIZE: u32 = 64 * 1024 * 1024;
+pub const MAX_BLOCK_SIZE: u32 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum SegmentError {
@@ -22,17 +22,38 @@ pub enum SegmentError {
     UnsupportedVersion(u16),
     IncompatibleRecordSize(u32),
     TruncatedSegmentHeader,
-    TruncatedBlockHeader { offset: u64 },
-    TruncatedBlockPayload { offset: u64 },
-    InvalidBlockSize { expected: u32, actual: u32 },
+    TruncatedBlockHeader {
+        offset: u64,
+    },
+    TruncatedBlockPayload {
+        offset: u64,
+    },
+    InvalidBlockSize {
+        expected: u32,
+        actual: u32,
+    },
     BlockTooLarge(u32),
-    ChecksumMismatch { offset: u64, expected: u32, actual: u32 },
+    ChecksumMismatch {
+        offset: u64,
+        expected: u32,
+        actual: u32,
+    },
     EventDecode(DecodeError),
     TimestampOutOfBounds,
-    SegmentIdMismatch { expected: u32, actual: u32 },
-    RecordIndexOutOfBounds { index: u32, count: u32 },
-    HeaderChecksumMismatch { offset: u64 },
-    EmptyBlock { offset: u64 },
+    SegmentIdMismatch {
+        expected: u32,
+        actual: u32,
+    },
+    RecordIndexOutOfBounds {
+        index: u32,
+        count: u32,
+    },
+    HeaderChecksumMismatch {
+        offset: u64,
+    },
+    EmptyBlock {
+        offset: u64,
+    },
 }
 
 impl fmt::Display for SegmentError {
@@ -50,16 +71,45 @@ impl fmt::Display for SegmentError {
                 write!(f, "Обрезано тело блока на смещении {}", offset)
             }
             Self::InvalidBlockSize { expected, actual } => {
-                write!(f, "Несоответствие размера блока: ожидалось {}, получено {}", expected, actual)
+                write!(
+                    f,
+                    "Несоответствие размера блока: ожидалось {}, получено {}",
+                    expected, actual
+                )
             }
-            Self::BlockTooLarge(size) => write!(f, "Размер блока {} превышает допустимый лимит", size),
-            Self::ChecksumMismatch { offset, expected, actual } => write!(
+            Self::BlockTooLarge(size) => {
+                write!(f, "Размер блока {} превышает допустимый лимит", size)
+            }
+            Self::ChecksumMismatch {
+                offset,
+                expected,
+                actual,
+            } => write!(
                 f,
                 "Ошибка CRC32 в блоке на смещении {}: ожидалось {:#X}, получено {:#X}",
                 offset, expected, actual
             ),
             Self::EventDecode(e) => write!(f, "Ошибка декодирования события: {:?}", e),
-            Self::TimestampOutOfBounds => write!(f, "Временная метка события выходит за границы заголовка блока"),
+            Self::TimestampOutOfBounds => write!(
+                f,
+                "Временная метка события выходит за границы заголовка блока"
+            ),
+                        Self::SegmentIdMismatch { expected, actual } => write!(
+                f,
+                "Несоответствие ID сегмента: ожидался {}, получен {}",
+                expected, actual
+            ),
+            Self::RecordIndexOutOfBounds { index, count } => write!(
+                f,
+                "Индекс записи {} выходит за пределы блока (всего записей: {})",
+                index, count
+            ),
+            Self::HeaderChecksumMismatch { offset } => {
+                write!(f, "Неверная контрольная сумма заголовка на смещении {}", offset)
+            },
+            Self::EmptyBlock { offset } => {
+                write!(f, "Обнаружен пустой блок (0 записей) на смещении {}", offset)
+            },
         }
     }
 }
@@ -100,9 +150,12 @@ impl SegmentReader {
             Err(e) => return Err(SegmentError::Io(e)),
         }
 
-        let header = SegmentHeader::decode(&header_buf)
-            .ok_or(SegmentError::TruncatedSegmentHeader)?;
+        let header =
+            SegmentHeader::decode(&header_buf).ok_or(SegmentError::TruncatedSegmentHeader)?;
 
+            if header.header_checksum != header.compute_checksum() {
+                return Err(SegmentError::HeaderChecksumMismatch { offset: 0 });
+            }
         if header.magic != MAGIC {
             return Err(SegmentError::InvalidMagic(header.magic));
         }
@@ -112,9 +165,6 @@ impl SegmentReader {
         if header.record_size != BIN_SIZE as u32 {
             return Err(SegmentError::IncompatibleRecordSize(header.record_size));
         }
-        if header.header_checksum != header.compute_checksum() {
-            return Err(SegmentError::HeaderChecksumMismatch { offset: 0 })
-        } 
 
         Ok(Self {
             reader,
@@ -152,17 +202,22 @@ impl SegmentReader {
             return Ok(false);
         }
 
-        let block_header.compute_checksum() != block_header.header_checksum {
-            return Err(SegmentError::HeaderChecksumMismatch { offset: block_offset });
+        let block_header =
+            BlockHeader::decode(&header_buf).ok_or(SegmentError::TruncatedBlockHeader {
+                offset: block_offset,
+            })?;
+
+        if block_header.header_checksum != block_header.compute_checksum() {
+            return Err(SegmentError::HeaderChecksumMismatch {
+                offset: block_offset,
+            });
         }
-
-        let block_header = BlockHeader::decode(&header_buf)
-            .ok_or(SegmentError::TruncatedBlockHeader { offset: block_offset })?;
-
-        if block_header.block_size > MAX_BLOCK_SIZE {
-            return Err(SegmentError::BlockTooLarge(block_header.block_size));
+        if block_header.records_count == 0 {
+            return Err(SegmentError::EmptyBlock {
+                offset: block_offset, // или event_ref.block_offset в read_at
+            });
         }
-
+        
         let expected_size = block_header
             .records_count
             .checked_mul(BIN_SIZE as u32)
@@ -174,12 +229,18 @@ impl SegmentReader {
                 actual: block_header.block_size,
             });
         }
+        
+        if block_header.block_size > MAX_BLOCK_SIZE {
+            return Err(SegmentError::BlockTooLarge(block_header.block_size));
+        }
 
         let mut payload_buf = vec![0u8; block_header.block_size as usize];
         match self.reader.read_exact(&mut payload_buf) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                return Err(SegmentError::TruncatedBlockPayload { offset: block_offset });
+                return Err(SegmentError::TruncatedBlockPayload {
+                    offset: block_offset,
+                });
             }
             Err(e) => return Err(SegmentError::Io(e)),
         }
@@ -198,8 +259,9 @@ impl SegmentReader {
             .reserve(block_header.records_count as usize);
 
         for _ in 0..block_header.records_count {
-            let event = codec::decode(&mut cursor)?
-                .ok_or(SegmentError::TruncatedBlockPayload { offset: block_offset })?;
+            let event = codec::decode(&mut cursor)?.ok_or(SegmentError::TruncatedBlockPayload {
+                offset: block_offset,
+            })?;
 
             if event.timestamp < block_header.min_timestamp
                 || event.timestamp > block_header.max_timestamp
@@ -228,7 +290,7 @@ impl SegmentReader {
         self.reader.seek(SeekFrom::Start(event_ref.block_offset))?;
         self.current_block_events.clear();
 
-        // 3. Читаем и валидируем BlockHeader (28 байт)
+        // 3. Читаем и валидируем BlockHeader (32 байт)
         let mut header_buf = [0u8; BLOCK_HEADER_SIZE];
         match self.reader.read_exact(&mut header_buf) {
             Ok(()) => {}
@@ -240,11 +302,21 @@ impl SegmentReader {
             Err(e) => return Err(SegmentError::Io(e)),
         }
 
-        let block_header = BlockHeader::decode(&header_buf).ok_or(
-            SegmentError::TruncatedBlockHeader {
+        let block_header =
+            BlockHeader::decode(&header_buf).ok_or(SegmentError::TruncatedBlockHeader {
                 offset: event_ref.block_offset,
-            },
-        )?;
+            })?;
+
+        if block_header.header_checksum != block_header.compute_checksum() {
+            return Err(SegmentError::HeaderChecksumMismatch {
+                offset: event_ref.block_offset,
+            });
+        }
+        if block_header.records_count == 0 {
+            return Err(SegmentError::EmptyBlock {
+                offset: event_ref.block_offset, // или event_ref.block_offset в read_at
+            });
+        }
 
         // 4. Проверяем, что запрашиваемый индекс существует в этом блоке
         if event_ref.record_index >= block_header.records_count {
@@ -253,11 +325,7 @@ impl SegmentReader {
                 count: block_header.records_count,
             });
         }
-
-        if block_header.block_size > MAX_BLOCK_SIZE {
-            return Err(SegmentError::BlockTooLarge(block_header.block_size));
-        }
-
+        
         let expected_size = block_header
             .records_count
             .checked_mul(BIN_SIZE as u32)
@@ -268,6 +336,10 @@ impl SegmentReader {
                 expected: expected_size,
                 actual: block_header.block_size,
             });
+        }
+        
+        if block_header.block_size > MAX_BLOCK_SIZE {
+            return Err(SegmentError::BlockTooLarge(block_header.block_size));
         }
 
         // 5. Читаем полезные данные блока и сверяем CRC32
@@ -293,15 +365,13 @@ impl SegmentReader {
 
         // 6. Вырезаем только нужное событие по смещению без декодирования всего блока
         let record_offset = (event_ref.record_index as usize) * BIN_SIZE;
-        let mut record_bytes = Bytes::copy_from_slice(
-            &payload_buf[record_offset..record_offset + BIN_SIZE],
-        );
+        let mut record_bytes =
+            Bytes::copy_from_slice(&payload_buf[record_offset..record_offset + BIN_SIZE]);
 
-        let event = codec::decode(&mut record_bytes)?.ok_or(
-            SegmentError::TruncatedBlockPayload {
+        let event =
+            codec::decode(&mut record_bytes)?.ok_or(SegmentError::TruncatedBlockPayload {
                 offset: event_ref.block_offset,
-            },
-        )?;
+            })?;
 
         if event.timestamp < block_header.min_timestamp
             || event.timestamp > block_header.max_timestamp
@@ -346,4 +416,3 @@ fn read_exact_or_eof<R: Read>(
     }
     Ok(true)
 }
-
