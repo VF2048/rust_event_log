@@ -74,4 +74,16 @@ impl<Id: DictionaryId> Dictionary<Id> {
     pub fn get(&self, id: Id) -> Option<&str> {
         self.by_id.get(id.index() as usize).map(String::as_str)
     }
+
+    pub fn find_substring(&self, query: &str) -> Vec<Id> {
+        if query.is_empty() {
+            return Vec::new()
+        }
+        self.by_id
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.contains(query))
+            .map(|(idx, _)| Id::from_index(idx as u32))
+            .collect()
+    }
 }
