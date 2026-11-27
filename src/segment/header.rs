@@ -148,7 +148,7 @@ impl BlockHeader {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct EventRef {
     pub segment_id: u32,
     pub block_offset: u64,
