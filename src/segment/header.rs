@@ -153,4 +153,5 @@ pub struct EventRef {
     pub segment_id: u32,
     pub block_offset: u64,
     pub record_index: u32,
+    pub timestamp: i64,
 }

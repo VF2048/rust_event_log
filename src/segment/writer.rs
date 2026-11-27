@@ -52,6 +52,7 @@ impl SegmentWriter {
             segment_id: self.segment_id,
             block_offset: self.bytes_written,
             record_index: self.records_in_block,
+            timestamp: event.timestamp,
         };
 
         let encoded = codec::encode(event);
